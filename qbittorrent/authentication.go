@@ -10,7 +10,8 @@ import (
 )
 
 type Authentication interface {
-	// Login cookie-based authentication
+	// Login cookie-based authentication, after calling NewClient, do not need to call Login again,
+	// it is the default behavior
 	Login() error
 	// Logout deactivate cookies
 	Logout() error

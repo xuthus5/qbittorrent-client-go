@@ -1,7 +1,6 @@
 package qbittorrent
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,11 +24,6 @@ type requestData struct {
 	body        io.Reader
 	debug       bool
 }
-
-var (
-	ErrNotLogin   = errors.New("not login")
-	ErrAuthFailed = errors.New("auth failed")
-)
 
 var _ Client = (*client)(nil)
 
@@ -107,6 +101,13 @@ func (c *client) doRequest(data *requestData) (*responseResult, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if data.debug {
+		response, err := httputil.DumpResponse(resp, true)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Println(string(response))
+	}
 
 	readAll, err := io.ReadAll(resp.Body)
 	if err != nil {

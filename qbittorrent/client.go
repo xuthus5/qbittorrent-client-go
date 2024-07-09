@@ -10,13 +10,13 @@ type Client interface {
 	Log() Log
 	// Sync get qBittorrent events
 	Sync() Sync
-	// Transfer transfer info
+	// Transfer transfer manage
 	Transfer() Transfer
-	// Torrent manage
+	// Torrent manage for torrent
 	Torrent() Torrent
-	// Search api
+	// Search api for search
 	Search() Search
-	// RSS api
+	// RSS api for rss
 	RSS() RSS
 }
 

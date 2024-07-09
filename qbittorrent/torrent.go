@@ -1,9 +1,14 @@
 package qbittorrent
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/bytedance/sonic"
@@ -35,7 +40,8 @@ type Torrent interface {
 	RecheckTorrents(hashes []string) error
 	// ReAnnounceTorrents the hashes of the torrents you want to reannounce
 	ReAnnounceTorrents(hashes []string) error
-	// AddNewTorrent add torrents from server local file or from URLs. http://, https://, magnet: and bc://bt/ links are supported
+	// AddNewTorrent add torrents from server local file or from URLs. http://, https://,
+	// magnet: and bc://bt/ links are supported, but only one onetime
 	AddNewTorrent(opt *TorrentAddOption) error
 	// AddTrackers add trackers to torrent
 	AddTrackers(hash string, urls []string) error
@@ -57,9 +63,13 @@ type Torrent interface {
 	SetFilePriority(hash string, id string, priority int) error
 	// GetDownloadLimit get torrent download limit
 	GetDownloadLimit(hashes []string) (map[string]int, error)
-	// SetDownloadLimit set torrent download limit, limit in bytes per second
+	// SetDownloadLimit set torrent download limit, limit in bytes per second, if no limit please set value zero
 	SetDownloadLimit(hashes []string, limit int) error
-	// SetShareLimit set torrent share limit
+	// SetShareLimit set torrent share limit, ratioLimit: the maximum seeding ratio for the torrent, -2 means the
+	// global limit should be used, -1 means no limit; seedingTimeLimit: the maximum seeding time (minutes) for the
+	// torrent, -2 means the global limit should be used, -1 means no limit; inactiveSeedingTimeLimit: the maximum
+	// amount of time (minutes) the torrent is allowed to seed while being inactive, -2 means the global limit should
+	// be used, -1 means no limit.
 	SetShareLimit(hashes []string, ratioLimit float64, seedingTimeLimit, inactiveSeedingTimeLimit int) error
 	// GetUploadLimit get torrent upload limit
 	GetUploadLimit(hashes []string) (map[string]int, error)
@@ -248,24 +258,32 @@ type TorrentContent struct {
 	Size         int64  `json:"size,omitempty"`
 }
 
+type TorrentAddFileMetadata struct {
+	// Filename only used to distinguish two files in form-data, does not work on the server side,
+	// for different files, please give different identification names
+	Filename string
+	// Data read torrent file content and set to here
+	Data []byte
+}
+
 type TorrentAddOption struct {
-	URLs               []string `schema:"-"`
-	Torrents           []byte   `schema:"-"`
-	SavePath           string   `schema:"save_path,omitempty"`
-	Cookies            string   `schema:"cookie,omitempty"`
-	Category           string   `schema:"category,omitempty"`
-	Tags               []string `schema:"-"`
-	SkipChecking       bool     `schema:"skip_checking,omitempty"`
-	Paused             bool     `schema:"paused,omitempty"`
-	RootFolder         bool     `schema:"root_folder,omitempty"`
-	Rename             string   `schema:"rename,omitempty"`
-	UpLimit            int      `schema:"upLimit,omitempty"`
-	DlLimit            int      `schema:"dlLimit,omitempty"`
-	RatioLimit         int      `schema:"ratioLimit,omitempty"`
-	SeedingTimeLimit   int      `schema:"seedingTimeLimit,omitempty"`
-	AutoTMM            bool     `schema:"autoTMM,omitempty"`
-	SequentialDownload bool     `schema:"sequentialDownload,omitempty"`
-	FirstLastPiecePrio bool     `schema:"firstLastPiecePrio,omitempty"`
+	URLs               []string                  `schema:"-"`                            // torrents url
+	Torrents           []*TorrentAddFileMetadata `schema:"-"`                            // raw data of torrent file
+	SavePath           string                    `schema:"save_path,omitempty"`          // download folder, optional
+	Cookies            string                    `schema:"cookie,omitempty"`             // cookie sent to download torrent file, optional
+	Category           string                    `schema:"category,omitempty"`           // category for the torrent, optional
+	Tags               []string                  `schema:"-"`                            // tags for the torrent, optional
+	SkipChecking       bool                      `schema:"skip_checking,omitempty"`      // skip hash checking, optional
+	Paused             bool                      `schema:"paused,omitempty"`             // add torrent in the pause state, optional
+	RootFolder         bool                      `schema:"root_folder,omitempty"`        // create the root folder, optional
+	Rename             string                    `schema:"rename,omitempty"`             // rename torrent, optional
+	UpLimit            int                       `schema:"upLimit,omitempty"`            // set torrent upload speed, Unit in bytes/second, optional
+	DlLimit            int                       `schema:"dlLimit,omitempty"`            // set torrent download speed, Unit in bytes/second, optional
+	RatioLimit         float64                   `schema:"ratioLimit,omitempty"`         // set torrent share ratio limit, optional
+	SeedingTimeLimit   int                       `schema:"seedingTimeLimit,omitempty"`   // set torrent seeding torrent limit, Unit in minutes, optional
+	AutoTMM            bool                      `schema:"autoTMM,omitempty"`            // whether Automatic Torrent Management should be used, optional
+	SequentialDownload string                    `schema:"sequentialDownload,omitempty"` // enable sequential download, optional
+	FirstLastPiecePrio string                    `schema:"firstLastPiecePrio,omitempty"` // prioritize download first last piece, optional
 }
 
 type TorrentCategory struct {
@@ -440,9 +458,13 @@ func (c *client) PauseTorrents(hashes []string) error {
 	if len(hashes) == 0 {
 		return errors.New("no torrent hashes provided")
 	}
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/pieceHashes?hashes=%s", c.config.Address, strings.Join(hashes, "|"))
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/pause", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
@@ -458,9 +480,13 @@ func (c *client) ResumeTorrents(hashes []string) error {
 	if len(hashes) == 0 {
 		return errors.New("no torrent hashes provided")
 	}
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/resume?hashes=%s", c.config.Address, strings.Join(hashes, "|"))
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/resume", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
@@ -476,9 +502,14 @@ func (c *client) DeleteTorrents(hashes []string, deleteFile bool) error {
 	if len(hashes) == 0 {
 		return errors.New("no torrent hashes provided")
 	}
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/resume?hashes=%s&deleteFiles=%t", c.config.Address, strings.Join(hashes, "|"), deleteFile)
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	formData.Add("deleteFile", strconv.FormatBool(deleteFile))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/resume", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
@@ -494,9 +525,13 @@ func (c *client) RecheckTorrents(hashes []string) error {
 	if len(hashes) == 0 {
 		return errors.New("no torrent hashes provided")
 	}
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/recheck?hashes=%s", c.config.Address, strings.Join(hashes, "|"))
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/recheck", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
@@ -512,9 +547,13 @@ func (c *client) ReAnnounceTorrents(hashes []string) error {
 	if len(hashes) == 0 {
 		return errors.New("no torrent hashes provided")
 	}
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/reannounce?hashes=%s", c.config.Address, strings.Join(hashes, "|"))
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/reannounce", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
@@ -527,56 +566,156 @@ func (c *client) ReAnnounceTorrents(hashes []string) error {
 }
 
 func (c *client) AddNewTorrent(opt *TorrentAddOption) error {
-	panic("implement me")
-}
+	var requestBody bytes.Buffer
+	var writer = multipart.NewWriter(&requestBody)
 
-func (c *client) AddTrackers(hash string, urls []string) error {
-	if len(urls) == 0 {
-		return errors.New("no trackers urls provided")
+	if len(opt.URLs) == 0 && len(opt.Torrents) == 0 {
+		return errors.New("no torrent url or data provided")
 	}
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/addTrackers?hash=%s&urls=%s", c.config.Address, hash, strings.Join(urls, "%0A"))
+
+	if opt.SavePath != "" {
+		_ = writer.WriteField("savePath", opt.SavePath)
+	}
+	if opt.Cookies != "" {
+		_ = writer.WriteField("cookies", opt.Cookies)
+	}
+	if opt.Category != "" {
+		_ = writer.WriteField("category", opt.Category)
+	}
+	if len(opt.Tags) != 0 {
+		_ = writer.WriteField("tags", strings.Join(opt.Tags, ","))
+	}
+	if opt.SkipChecking {
+		_ = writer.WriteField("skip_checking", "true")
+	}
+	if opt.Paused {
+		_ = writer.WriteField("paused", "true")
+	}
+	if opt.RootFolder {
+		_ = writer.WriteField("root_folder", "true")
+	}
+	if opt.Rename != "" {
+		_ = writer.WriteField("rename", opt.Rename)
+	}
+	if opt.UpLimit != 0 {
+		_ = writer.WriteField("upLimit", strconv.Itoa(opt.UpLimit))
+	}
+	if opt.DlLimit != 0 {
+		_ = writer.WriteField("dlLimit", strconv.Itoa(opt.DlLimit))
+	}
+	if opt.RatioLimit != 0 {
+		_ = writer.WriteField("ratioLimit", strconv.FormatFloat(opt.RatioLimit, 'f', -1, 64))
+	}
+	if opt.SeedingTimeLimit != 0 {
+		_ = writer.WriteField("seedingTimeLimit", strconv.Itoa(opt.SeedingTimeLimit))
+	}
+	if opt.AutoTMM {
+		_ = writer.WriteField("autoTMM", "true")
+	}
+	if opt.SequentialDownload != "" {
+		_ = writer.WriteField("sequentialDownload", opt.SequentialDownload)
+	}
+	if opt.FirstLastPiecePrio != "" {
+		_ = writer.WriteField("firstLastPiecePrio", opt.FirstLastPiecePrio)
+	}
+
+	if len(opt.URLs) != 0 {
+		_ = writer.WriteField("urls", strings.Join(opt.URLs, "\n"))
+	} else if len(opt.Torrents) != 0 {
+		for _, torrent := range opt.Torrents {
+			formFile, err := writer.CreateFormFile("torrents", torrent.Filename)
+			if err != nil {
+				return err
+			}
+			_, err = io.Copy(formFile, bytes.NewReader(torrent.Data))
+			if err != nil {
+				return err
+			}
+		}
+	}
+	_ = writer.Close()
+
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/add", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:         apiUrl,
+		method:      http.MethodPost,
+		contentType: writer.FormDataContentType(),
+		body:        &requestBody,
+		debug:       true,
 	})
 	if err != nil {
 		return err
 	}
 
 	if result.code != 200 {
-		return errors.New("addTrackers torrents failed: " + string(result.body))
+		return errors.New("add torrents failed: " + string(result.body))
+	}
+	return nil
+}
+
+func (c *client) AddTrackers(hash string, urls []string) error {
+	if len(urls) == 0 {
+		return errors.New("no torrent tracker provided")
+	}
+	var formData = url.Values{}
+	formData.Add("urls", strings.Join(urls, "%0A"))
+	formData.Add("hash", hash)
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/addTrackers", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("add torrent trackers failed: " + string(result.body))
 	}
 	return nil
 }
 
 func (c *client) EditTrackers(hash, origUrl, newUrl string) error {
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/editTracker?hash=%s&origUrl=%s&newUrl=%s", c.config.Address, hash, origUrl, newUrl)
+	var formData = url.Values{}
+	formData.Add("origUrl", origUrl)
+	formData.Add("newUrl", newUrl)
+	formData.Add("hash", hash)
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/editTracker", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
 	}
 
 	if result.code != 200 {
-		return errors.New("editTracker torrents failed: " + string(result.body))
+		return errors.New("edit torrent trackers failed: " + string(result.body))
 	}
 	return nil
 }
 
 func (c *client) RemoveTrackers(hash string, urls []string) error {
 	if len(urls) == 0 {
-		return errors.New("no trackers urls provided")
+		return errors.New("no torrent tracker provided")
 	}
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/removeTrackers?hash=%s&urls=%s", c.config.Address, hash, strings.Join(urls, "|"))
+	var formData = url.Values{}
+	formData.Add("hash", hash)
+	formData.Add("urls", strings.Join(urls, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/removeTrackers", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
 	}
 
 	if result.code != 200 {
-		return errors.New("removeTrackers torrents failed: " + string(result.body))
+		return errors.New("remove torrent trackers failed: " + string(result.body))
 	}
 	return nil
 }
@@ -588,9 +727,14 @@ func (c *client) AddPeers(hashes []string, peers []string) error {
 	if len(peers) == 0 {
 		return errors.New("no peers provided")
 	}
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/addPeers?hashes=%s&peers=%s", c.config.Address, strings.Join(hashes, "|"), strings.Join(peers, "|"))
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	formData.Add("peers", strings.Join(peers, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/addPeers", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
@@ -606,9 +750,13 @@ func (c *client) IncreasePriority(hashes []string) error {
 	if len(hashes) == 0 {
 		return errors.New("no hashes provided")
 	}
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/increasePrio?hashes=%s", c.config.Address, strings.Join(hashes, "|"))
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/increasePrio", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
@@ -624,9 +772,13 @@ func (c *client) DecreasePriority(hashes []string) error {
 	if len(hashes) == 0 {
 		return errors.New("no hashes provided")
 	}
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/decreasePrio?hashes=%s", c.config.Address, strings.Join(hashes, "|"))
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/decreasePrio", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
@@ -642,9 +794,13 @@ func (c *client) MaxPriority(hashes []string) error {
 	if len(hashes) == 0 {
 		return errors.New("no hashes provided")
 	}
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/topPrio?hashes=%s", c.config.Address, strings.Join(hashes, "|"))
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/topPrio", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
@@ -660,9 +816,13 @@ func (c *client) MinPriority(hashes []string) error {
 	if len(hashes) == 0 {
 		return errors.New("no hashes provided")
 	}
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/bottomPrio?hashes=%s", c.config.Address, strings.Join(hashes, "|"))
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/bottomPrio", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
@@ -675,136 +835,520 @@ func (c *client) MinPriority(hashes []string) error {
 }
 
 func (c *client) SetFilePriority(hash string, id string, priority int) error {
-	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/bottomPrio?hash=%s&id=%s&priority=%d", c.config.Address, hash, id, priority)
+	var formData = url.Values{}
+	formData.Add("hash", hash)
+	formData.Add("id", id)
+	formData.Add("priority", strconv.Itoa(priority))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/filePrio", c.config.Address)
 	result, err := c.doRequest(&requestData{
-		url: apiUrl,
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
 	})
 	if err != nil {
 		return err
 	}
 
 	if result.code != 200 {
-		return errors.New("bottomPrio torrents failed: " + string(result.body))
+		return errors.New("filePrio torrents failed: " + string(result.body))
 	}
 	return nil
 }
 
 func (c *client) GetDownloadLimit(hashes []string) (map[string]int, error) {
-	//TODO implement me
-	panic("implement me")
+	if len(hashes) == 0 {
+		return nil, errors.New("no hashes provided")
+	}
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/downloadLimit", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if result.code != 200 {
+		return nil, errors.New("get torrents download limit failed: " + string(result.body))
+	}
+	var data = make(map[string]int)
+	err = sonic.Unmarshal(result.body, &data)
+	return data, err
 }
 
 func (c *client) SetDownloadLimit(hashes []string, limit int) error {
-	//TODO implement me
-	panic("implement me")
+	if len(hashes) == 0 {
+		return errors.New("no hashes provided")
+	}
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	formData.Add("limit", strconv.Itoa(limit))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/setDownloadLimit", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("set torrents download limit failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) SetShareLimit(hashes []string, ratioLimit float64, seedingTimeLimit, inactiveSeedingTimeLimit int) error {
-	//TODO implement me
-	panic("implement me")
+	if len(hashes) == 0 {
+		return errors.New("no hashes provided")
+	}
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	formData.Add("ratioLimit", strconv.FormatFloat(ratioLimit, 'f', -1, 64))
+	formData.Add("seedingTimeLimit", strconv.Itoa(seedingTimeLimit))
+	formData.Add("inactiveSeedingTimeLimit", strconv.Itoa(inactiveSeedingTimeLimit))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/setShareLimits", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("set torrents share limit failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) GetUploadLimit(hashes []string) (map[string]int, error) {
-	//TODO implement me
-	panic("implement me")
+	if len(hashes) == 0 {
+		return nil, errors.New("no hashes provided")
+	}
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/uploadLimit", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if result.code != 200 {
+		return nil, errors.New("get torrents upload limit failed: " + string(result.body))
+	}
+	var data = make(map[string]int)
+	err = sonic.Unmarshal(result.body, &data)
+	return data, err
 }
 
 func (c *client) SetUploadLimit(hashes []string, limit int) error {
-	//TODO implement me
-	panic("implement me")
+	if len(hashes) == 0 {
+		return errors.New("no hashes provided")
+	}
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	formData.Add("limit", strconv.Itoa(limit))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/setUploadLimit", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("set torrents upload limit failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) SetLocation(hashes []string, location string) error {
-	//TODO implement me
-	panic("implement me")
+	if len(hashes) == 0 {
+		return errors.New("no hashes provided")
+	}
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	formData.Add("location", location)
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/setLocation", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("set torrents location failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) SetName(hash string, name string) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("hash", hash)
+	formData.Add("name", name)
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/rename", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("set torrents name failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) SetCategory(hashes []string, category string) error {
-	//TODO implement me
-	panic("implement me")
+	if len(hashes) == 0 {
+		return errors.New("no hashes provided")
+	}
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	formData.Add("category", category)
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/setCategory", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("set torrents category failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) GetCategories() (map[string]*TorrentCategory, error) {
-	//TODO implement me
-	panic("implement me")
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/categories", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if result.code != 200 {
+		return nil, errors.New("get torrents upload limit failed: " + string(result.body))
+	}
+	var data = make(map[string]*TorrentCategory)
+	err = sonic.Unmarshal(result.body, &data)
+	return data, err
 }
 
 func (c *client) AddNewCategory(category, savePath string) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("category", category)
+	formData.Add("savePath", savePath)
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/createCategory", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("add new category failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) EditCategory(category, savePath string) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("category", category)
+	formData.Add("savePath", savePath)
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/editCategory", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("add new category failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) RemoveCategories(categories []string) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("categories", strings.Join(categories, "\n"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/removeCategories", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("remove categories failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) AddTags(hashes []string, tags []string) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	formData.Add("tags", strings.Join(tags, ","))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/addTags", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("add torrent tags failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) RemoveTags(hashes []string, tags []string) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	formData.Add("tags", strings.Join(tags, ","))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/removeTags", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("remove torrent tags failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) GetTags() ([]string, error) {
-	//TODO implement me
-	panic("implement me")
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/tags", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodGet,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if result.code != 200 {
+		return nil, errors.New("get tags failed: " + string(result.body))
+	}
+	var data []string
+	err = sonic.Unmarshal(result.body, &data)
+	return data, err
 }
 
 func (c *client) CreateTags(tags []string) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("tags", strings.Join(tags, ","))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/createTags", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("create tags failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) DeleteTags(tags []string) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("tags", strings.Join(tags, ","))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/deleteTags", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("delete tags failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) SetAutomaticManagement(hashes []string, enable bool) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	formData.Add("enable", strconv.FormatBool(enable))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/setAutoManagement", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("set automatic management failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) ToggleSequentialDownload(hashes []string) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/toggleSequentialDownload", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("toggle sequential download failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) SetFirstLastPiecePriority(hashes []string) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/toggleFirstLastPiecePrio", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("toggle first last piece prio failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) SetForceStart(hashes []string, force bool) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	formData.Add("value", strconv.FormatBool(force))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/setForceStart", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("set force start failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) SetSuperSeeding(hashes []string, enable bool) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("hashes", strings.Join(hashes, "|"))
+	formData.Add("value", strconv.FormatBool(enable))
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/setSuperSeeding", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("set super seeding failed: " + string(result.body))
+	}
+	return err
 }
 
 func (c *client) RenameFile(hash, oldPath, newPath string) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("oldPath", oldPath)
+	formData.Add("newPath", newPath)
+	formData.Add("hash", hash)
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/renameFile", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("rename file failed: " + string(result.body))
+	}
+	return nil
 }
 
 func (c *client) RenameFolder(hash, oldPath, newPath string) error {
-	//TODO implement me
-	panic("implement me")
+	var formData = url.Values{}
+	formData.Add("oldPath", oldPath)
+	formData.Add("newPath", newPath)
+	formData.Add("hash", hash)
+	var apiUrl = fmt.Sprintf("%s/api/v2/torrents/renameFolder", c.config.Address)
+	result, err := c.doRequest(&requestData{
+		url:    apiUrl,
+		method: http.MethodPost,
+		body:   strings.NewReader(formData.Encode()),
+	})
+	if err != nil {
+		return err
+	}
+
+	if result.code != 200 {
+		return errors.New("rename folder failed: " + string(result.body))
+	}
+	return nil
 }
