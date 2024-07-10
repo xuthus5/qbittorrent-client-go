@@ -44,3 +44,11 @@ func TestFormEncoder(t *testing.T) {
 	}
 	t.Log(form)
 }
+
+func TestFormEncode(t *testing.T) {
+	var form = url.Values{}
+	form.Add("username", "admin hahaha")
+	form.Add("password", "J0710c?//&z5")
+	fe := form.Encode()
+	t.Log(fe)
+}

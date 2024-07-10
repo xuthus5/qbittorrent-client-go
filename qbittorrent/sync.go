@@ -3,6 +3,8 @@ package qbittorrent
 import (
 	"errors"
 	"fmt"
+	"net/url"
+	"strconv"
 
 	"github.com/bytedance/sonic"
 )
@@ -95,7 +97,10 @@ func (c *client) MainData(rid int) (*SyncMainData, error) {
 }
 
 func (c *client) TorrentPeersData(hash string, rid int) (*SyncTorrentPeers, error) {
-	apiUrl := fmt.Sprintf("%s/api/v2/sync/torrentPeers?hash=%s&rid=%d", c.config.Address, hash, rid)
+	var formData = url.Values{}
+	formData.Add("hash", hash)
+	formData.Add("rid", strconv.Itoa(rid))
+	apiUrl := fmt.Sprintf("%s/api/v2/sync/torrentPeers?%s", c.config.Address, formData.Encode())
 	result, err := c.doRequest(&requestData{
 		url: apiUrl,
 	})
